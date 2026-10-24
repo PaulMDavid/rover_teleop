@@ -7,9 +7,7 @@
 // image fills the screen under two transparent controls: a hold-to-drive switch on the
 // left and the joystick on the right. The camera streams only while its page is showing.
 //
-// The whole app is landscape (manifest: sensorLandscape) and never rotates at runtime:
-// switching orientation per page resized the PageView mid-swipe and bounced it back to
-// the controls page.
+// Landscape only (manifest: sensorLandscape); the orientation never changes at runtime.
 import 'dart:async';
 import 'dart:math';
 
