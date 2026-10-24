@@ -2,6 +2,14 @@
 // is `phone`. Commands go out at 10 Hz only while the app is in the foreground; leaving
 // it, locking the screen or losing Wi-Fi stops the stream, and the robot's deadman
 // (0.5 s) stops the rover. Everything shown comes from the robot's /teleop/state.
+//
+// Two pages: the controls, and the camera (swipe left, or "Camera ›"), where the ZED
+// image fills the screen under two transparent controls: a hold-to-drive switch on the
+// left and the joystick on the right. The camera streams only while its page is showing.
+//
+// The whole app is landscape (manifest: sensorLandscape) and never rotates at runtime:
+// switching orientation per page resized the PageView mid-swipe and bounced it back to
+// the controls page.
 import 'dart:async';
 import 'dart:math';
 
@@ -23,7 +31,8 @@ const wifi = MethodChannel('navws/wifi');
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+  SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   runApp(MaterialApp(
     title: 'Rover Teleop',
     debugShowCheckedModeBanner: false,
@@ -44,8 +53,13 @@ class TeleopPage extends StatefulWidget {
 }
 
 class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
+  static const controlsPage = 0, cameraPage = 1;
+
   final client = FoxgloveClient();
+  final pages = PageController();
   Offset stick = Offset.zero; // x right, y up, both -1..1
+  bool deadman = false; // camera page: joystick counts only while this is held
+  int page = controlsPage;
   bool foreground = true;
   String host = defaultHost;
   String? pendingMode;
@@ -81,14 +95,29 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState s) {
     foreground = s == AppLifecycleState.resumed;
-    if (!foreground) setState(() => stick = Offset.zero);
+    if (!foreground) {
+      setState(() {
+        stick = Offset.zero;
+        deadman = false;
+      });
+    }
+    client.watchCamera(foreground && page == cameraPage);
+  }
+
+  void _onPage(int p) {
+    setState(() {
+      page = p;
+      stick = Offset.zero;
+      deadman = false;
+    });
+    client.watchCamera(p == cameraPage && foreground);
   }
 
   void _send() {
     // in the background nothing is sent, so the robot's deadman stops the rover
     if (!foreground) return;
     final st = client.state;
-    final usable = st != null && st.fresh;
+    final usable = st != null && st.fresh && (page == controlsPage || deadman);
     client.drive(usable ? stick.dy * st.maxLinear : 0, usable ? -stick.dx * st.maxAngular : 0);
   }
 
@@ -135,101 +164,231 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => Scaffold(
+        body: PageView(
+          controller: pages,
+          onPageChanged: _onPage,
+          // swipe to the camera; back only via "‹ Controls", so steering can't turn the page
+          physics: page == cameraPage ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
+          children: [_controls(), _camera()],
+        ),
+      );
+
+  RobotState? get _fresh {
     final st = client.state;
-    final fresh = st != null && st.fresh;
-    final connected = client.link == Link.connected;
-    final linkText = !connected
-        ? (client.link == Link.connecting ? 'connecting…' : 'no link')
-        : fresh ? 'connected' : 'no robot state';
-    final linkColor = !connected ? bad : fresh ? ok : warn;
-    final drivable = fresh && st.mode == 'manual' && st.source == 'phone';
+    return st != null && st.fresh ? st : null;
+  }
+
+  String get _linkText {
+    if (client.link != Link.connected) return client.link == Link.connecting ? 'connecting…' : 'no link';
+    return _fresh != null ? 'connected' : 'no robot state';
+  }
+
+  Color get _linkColor => client.link != Link.connected
+      ? bad
+      : _fresh != null
+          ? ok
+          : warn;
+
+  Widget _controls() {
+    final st = _fresh;
+    final drivable = st != null && st.mode == 'manual' && st.source == 'phone';
 
     String? warning;
-    if (fresh && st.source != 'phone') {
+    if (st != null && st.source != 'phone') {
       warning = 'The robot takes commands from "${st.source}". Only STOP works from the phone.';
-    } else if (fresh && st.mode != 'manual') {
+    } else if (st != null && st.mode != 'manual') {
       warning = 'The joystick drives only in Manual.';
     }
 
-    return Scaffold(
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(children: [
-                Expanded(child: _chip('Link', linkText, dot: linkColor)),
-                const SizedBox(width: 8),
-                Expanded(child: _chip('Robot mode', fresh ? st.mode : '—', color: fresh ? _modeColor(st.mode) : null)),
-              ]),
-              const SizedBox(height: 8),
-              Row(children: [
-                Expanded(child: _chip('Command source', fresh ? st.source : '—')),
-                const SizedBox(width: 8),
-                Expanded(child: _chip('Robot hears phone',
-                    !fresh ? '—' : st.hearsPhone ? 'yes (${(st.phoneAge! * 1000).round()} ms)' : 'no')),
-              ]),
-              if (warning != null) ...[
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF3B2A0A),
-                    border: Border.all(color: warn),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Text(warning, style: const TextStyle(color: Color(0xFFFDE68A))),
-                ),
-              ],
-              const SizedBox(height: 12),
-              Row(children: [
-                for (final m in ['autonomous', 'manual', 'stop']) ...[
-                  if (m != 'autonomous') const SizedBox(width: 8),
-                  Expanded(child: _modeButton(m, active: fresh && st.mode == m)),
-                ],
-              ]),
-              const SizedBox(height: 12),
-              Expanded(
+    final status = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(children: [
+          Expanded(child: _chip('Link', _linkText, dot: _linkColor)),
+          const SizedBox(width: 8),
+          Expanded(child: _chip('Robot mode', st?.mode ?? '—', color: st == null ? null : _modeColor(st.mode))),
+        ]),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(child: _chip('Command source', st?.source ?? '—')),
+          const SizedBox(width: 8),
+          Expanded(
+              child: _chip(
+                  'Robot hears phone',
+                  st == null
+                      ? '—'
+                      : st.hearsPhone
+                          ? 'yes (${(st.phoneAge! * 1000).round()} ms)'
+                          : 'no')),
+        ]),
+        if (warning != null) ...[
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: const Color(0xFF3B2A0A),
+              border: Border.all(color: warn),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(warning, style: const TextStyle(color: Color(0xFFFDE68A), fontSize: 13)),
+          ),
+        ],
+        const SizedBox(height: 8),
+        Row(children: [
+          for (final m in ['autonomous', 'manual', 'stop']) ...[
+            if (m != 'autonomous') const SizedBox(width: 8),
+            Expanded(child: _modeButton(m, active: st?.mode == m)),
+          ],
+        ]),
+        const Spacer(),
+        Listener(
+          onPointerDown: (_) => _stop(), // on press, not release
+          child: Container(
+            height: 72,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: bad,
+              borderRadius: BorderRadius.circular(36),
+              border: Border.all(color: const Color(0xFF7F1D1D), width: 4),
+            ),
+            child: const Text('STOP', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, letterSpacing: 3)),
+          ),
+        ),
+        Row(children: [
+          Expanded(
+            child: TextButton(
+              onPressed: _editHost,
+              child: Text(client.url, style: const TextStyle(color: dim, fontSize: 12)),
+            ),
+          ),
+          TextButton.icon(
+            onPressed: () =>
+                pages.animateToPage(cameraPage, duration: const Duration(milliseconds: 250), curve: Curves.easeOut),
+            icon: const Icon(Icons.videocam, size: 18),
+            label: const Text('Camera ›'),
+          ),
+        ]),
+      ],
+    );
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(flex: 5, child: status),
+            const SizedBox(width: 16),
+            Expanded(
+              flex: 4,
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 8),
                 child: Joystick(
                   enabled: drivable,
-                  value: stick,
+                  value: page == controlsPage ? stick : Offset.zero,
                   onChanged: (v) => setState(() => stick = v),
-                  readout: fresh
-                      ? 'v ${(stick.dy * st.maxLinear).toStringAsFixed(2)} m/s   '
-                        'ω ${(-stick.dx * st.maxAngular).toStringAsFixed(2)} rad/s'
-                      : '',
+                  readout: st == null
+                      ? ''
+                      : 'v ${(stick.dy * st.maxLinear).toStringAsFixed(2)} m/s   '
+                          'ω ${(-stick.dx * st.maxAngular).toStringAsFixed(2)} rad/s',
                 ),
               ),
-              const SizedBox(height: 12),
-              Listener(
-                onPointerDown: (_) => _stop(), // on press, not release
-                child: Container(
-                  height: 84,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: bad,
-                    borderRadius: BorderRadius.circular(42),
-                    border: Border.all(color: const Color(0xFF7F1D1D), width: 4),
-                  ),
-                  child: const Text('STOP',
-                      style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800, letterSpacing: 3)),
-                ),
-              ),
-              TextButton(
-                onPressed: _editHost,
-                child: Text(client.url, style: const TextStyle(color: dim, fontSize: 12)),
-              ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  Color _modeColor(String mode) =>
-      {'stop': bad, 'manual': accent, 'autonomous': ok}[mode] ?? Colors.white;
+  Widget _camera() {
+    final st = _fresh;
+    final drivable = st != null && st.mode == 'manual' && st.source == 'phone';
+    final status = [
+      _linkText,
+      if (st != null) st.mode.toUpperCase(),
+      if (client.cameraAvailable) '${client.cameraFps.toStringAsFixed(0)} fps',
+    ].join('   ·   ');
+    String? hint;
+    if (st != null && st.source != 'phone') {
+      hint = 'Robot takes commands from "${st.source}"';
+    } else if (st != null && st.mode != 'manual') {
+      hint = 'Set Manual on the controls page to drive';
+    }
+
+    return ColoredBox(
+      color: Colors.black,
+      child: Stack(fit: StackFit.expand, children: [
+        ValueListenableBuilder(
+          valueListenable: client.cameraFrame,
+          builder: (context, frame, _) => frame == null
+              ? Center(
+                  child: Text(
+                    client.link != Link.connected
+                        ? 'no link'
+                        : client.cameraAvailable
+                            ? 'waiting for camera…'
+                            : 'robot has no camera relay',
+                    style: const TextStyle(color: dim),
+                  ),
+                )
+              : Image.memory(frame, fit: BoxFit.contain, gaplessPlayback: true),
+        ),
+        Positioned(
+          top: 8,
+          left: 8,
+          right: 8,
+          child: Row(children: [
+            TextButton(
+              onPressed: () =>
+                  pages.animateToPage(controlsPage, duration: const Duration(milliseconds: 250), curve: Curves.easeOut),
+              child: const Text('‹ Controls', style: _overlayText),
+            ),
+            const SizedBox(width: 8),
+            Icon(Icons.circle, size: 10, color: _linkColor),
+            const SizedBox(width: 6),
+            Text(status, style: _overlayText),
+            const Spacer(),
+            if (hint != null) Text(hint, style: _overlayText.copyWith(color: const Color(0xFFFDE68A))),
+          ]),
+        ),
+        Positioned(
+          left: 32,
+          bottom: 32,
+          child: DeadmanSwitch(
+            held: deadman,
+            enabled: drivable,
+            onChanged: (held) {
+              if (held) HapticFeedback.mediumImpact();
+              setState(() => deadman = held);
+            },
+          ),
+        ),
+        Positioned(
+          right: 32,
+          bottom: 32,
+          width: 200,
+          height: 200,
+          child: Joystick(
+            overlay: true,
+            enabled: drivable && deadman,
+            value: page == cameraPage ? stick : Offset.zero,
+            onChanged: (v) => setState(() => stick = v),
+            readout: '',
+          ),
+        ),
+      ]),
+    );
+  }
+
+  static const _overlayText = TextStyle(
+    color: Colors.white,
+    fontSize: 13,
+    fontWeight: FontWeight.w600,
+    shadows: [Shadow(blurRadius: 4, color: Colors.black)],
+  );
+
+  Color _modeColor(String mode) => {'stop': bad, 'manual': accent, 'autonomous': ok}[mode] ?? Colors.white;
 
   Widget _chip(String label, String value, {Color? dot, Color? color}) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -269,21 +428,76 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         foregroundColor: Colors.white,
       ),
-      child: Text(mode[0].toUpperCase() + mode.substring(1),
-          style: const TextStyle(fontWeight: FontWeight.w600)),
+      child: Text(mode[0].toUpperCase() + mode.substring(1), style: const TextStyle(fontWeight: FontWeight.w600)),
     );
   }
 }
 
+/// Swallows horizontal drags that start on a control, so the PageView doesn't turn the
+/// page while someone is steering. Raw pointer events still reach the Listener inside.
+class _NoPageSwipe extends StatelessWidget {
+  const _NoPageSwipe({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) =>
+      GestureDetector(onHorizontalDragStart: (_) {}, behavior: HitTestBehavior.opaque, child: child);
+}
+
+/// Camera page, left thumb: the joystick drives only while this is held.
+class DeadmanSwitch extends StatelessWidget {
+  const DeadmanSwitch({super.key, required this.held, required this.enabled, required this.onChanged});
+
+  final bool held;
+  final bool enabled;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) => _NoPageSwipe(
+        child: Listener(
+          onPointerDown: (_) => onChanged(true),
+          onPointerUp: (_) => onChanged(false),
+          onPointerCancel: (_) => onChanged(false),
+          child: Container(
+            width: 150,
+            height: 150,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: held ? ok.withOpacity(.45) : Colors.white.withOpacity(.12),
+              border: Border.all(color: held ? ok : Colors.white.withOpacity(.4), width: 2),
+            ),
+            child: Text(
+              held ? 'DRIVING' : 'HOLD\nto drive',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withOpacity(enabled ? .95 : .5),
+                fontWeight: FontWeight.w700,
+                shadows: const [Shadow(blurRadius: 4, color: Colors.black)],
+              ),
+            ),
+          ),
+        ),
+      );
+}
+
 /// Spring-back joystick. Reports x (right) and y (up) in -1..1; releasing returns 0.
+/// `overlay`: transparent, for drawing on top of the camera image.
 class Joystick extends StatefulWidget {
-  const Joystick({super.key, required this.enabled, required this.value,
-      required this.onChanged, required this.readout});
+  const Joystick(
+      {super.key,
+      required this.enabled,
+      required this.value,
+      required this.onChanged,
+      required this.readout,
+      this.overlay = false});
 
   final bool enabled;
   final Offset value;
   final ValueChanged<Offset> onChanged;
   final String readout;
+  final bool overlay;
 
   @override
   State<Joystick> createState() => _JoystickState();
@@ -292,8 +506,10 @@ class Joystick extends StatefulWidget {
 class _JoystickState extends State<Joystick> {
   int? pointer;
 
+  double _radius(Size size) => min(size.width, size.height) * (widget.overlay ? 0.42 : 0.35);
+
   void _update(Offset local, Size size) {
-    final radius = min(size.width, size.height) * 0.35;
+    final radius = _radius(size);
     var d = local - size.center(Offset.zero);
     if (d.distance > radius) d = d / d.distance * radius;
     widget.onChanged(Offset(d.dx / radius, -d.dy / radius));
@@ -308,32 +524,34 @@ class _JoystickState extends State<Joystick> {
   Widget build(BuildContext context) => LayoutBuilder(builder: (context, c) {
         final size = Size(c.maxWidth, c.maxHeight);
         return Opacity(
-          opacity: widget.enabled ? 1 : .35,
-          child: Listener(
-            behavior: HitTestBehavior.opaque,
-            onPointerDown: (e) {
-              if (pointer != null) return;
-              pointer = e.pointer;
-              _update(e.localPosition, size);
-            },
-            onPointerMove: (e) {
-              if (e.pointer == pointer) _update(e.localPosition, size);
-            },
-            onPointerUp: (e) {
-              if (e.pointer == pointer) _release();
-            },
-            onPointerCancel: (e) {
-              if (e.pointer == pointer) _release();
-            },
-            child: CustomPaint(
-              size: size,
-              painter: _JoystickPainter(widget.value),
-              child: Align(
-                alignment: Alignment.bottomLeft,
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Text(widget.readout,
-                      style: const TextStyle(color: dim, fontFeatures: [FontFeature.tabularFigures()])),
+          opacity: widget.enabled ? 1 : (widget.overlay ? .6 : .35),
+          child: _NoPageSwipe(
+            child: Listener(
+              behavior: HitTestBehavior.opaque,
+              onPointerDown: (e) {
+                if (pointer != null) return;
+                pointer = e.pointer;
+                _update(e.localPosition, size);
+              },
+              onPointerMove: (e) {
+                if (e.pointer == pointer) _update(e.localPosition, size);
+              },
+              onPointerUp: (e) {
+                if (e.pointer == pointer) _release();
+              },
+              onPointerCancel: (e) {
+                if (e.pointer == pointer) _release();
+              },
+              child: CustomPaint(
+                size: size,
+                painter: _JoystickPainter(widget.value, _radius(size), widget.overlay),
+                child: Align(
+                  alignment: Alignment.bottomLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Text(widget.readout,
+                        style: const TextStyle(color: dim, fontFeatures: [FontFeature.tabularFigures()])),
+                  ),
                 ),
               ),
             ),
@@ -343,27 +561,44 @@ class _JoystickState extends State<Joystick> {
 }
 
 class _JoystickPainter extends CustomPainter {
-  _JoystickPainter(this.value);
+  _JoystickPainter(this.value, this.radius, this.overlay);
 
   final Offset value;
+  final double radius;
+  final bool overlay;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final r = RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(18));
-    canvas.drawRRect(r, Paint()..color = panel);
-    canvas.drawRRect(r, Paint()
-      ..color = line
-      ..style = PaintingStyle.stroke);
     final center = size.center(Offset.zero);
-    final radius = min(size.width, size.height) * 0.35;
-    canvas.drawCircle(center, radius, Paint()
-      ..color = line
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2);
+    if (overlay) {
+      canvas.drawCircle(center, radius, Paint()..color = Colors.white.withOpacity(.10));
+      canvas.drawCircle(
+          center,
+          radius,
+          Paint()
+            ..color = Colors.white.withOpacity(.45)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2);
+    } else {
+      final r = RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(18));
+      canvas.drawRRect(r, Paint()..color = panel);
+      canvas.drawRRect(
+          r,
+          Paint()
+            ..color = line
+            ..style = PaintingStyle.stroke);
+      canvas.drawCircle(
+          center,
+          radius,
+          Paint()
+            ..color = line
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2);
+    }
     final knob = center + Offset(value.dx, -value.dy) * radius;
-    canvas.drawCircle(knob, 36, Paint()..color = accent);
+    canvas.drawCircle(knob, overlay ? 32 : 36, Paint()..color = accent.withOpacity(overlay ? .6 : 1));
   }
 
   @override
-  bool shouldRepaint(_JoystickPainter old) => old.value != value;
+  bool shouldRepaint(_JoystickPainter old) => old.value != value || old.radius != radius;
 }

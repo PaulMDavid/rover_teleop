@@ -1,6 +1,8 @@
 // Foxglove WebSocket client (subprotocol foxglove.sdk.v1) for app_foxglove_bridge.
 // Publishes JSON-encoded /teleop/phone/cmd_vel and /teleop/phone/set_mode, and
-// subscribes /teleop/state: the mode the robot is actually in.
+// subscribes /teleop/state: the mode the robot is actually in. /teleop/camera/compressed
+// is subscribed only while the camera page wants it (app_teleop's teleop_camera relays
+// the ZED only while someone is subscribed).
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -29,11 +31,20 @@ class RobotState {
 enum Link { disconnected, connecting, connected }
 
 class FoxgloveClient extends ChangeNotifier {
-  static const _chCmd = 1, _chMode = 2, _subState = 1;
+  static const _chCmd = 1, _chMode = 2, _subState = 1, _subCamera = 2;
+  static const cameraTopic = '/teleop/camera/compressed';
 
   Link link = Link.disconnected;
   RobotState? state;
   String url = '';
+
+  /// Latest camera JPEG; updated without notifying the client's listeners, so frames
+  /// only rebuild the image widget.
+  final cameraFrame = ValueNotifier<Uint8List?>(null);
+  final _frameTimes = <DateTime>[];
+  bool _wantCamera = false;
+  int? _cameraChannel;
+  bool _cameraSubscribed = false;
 
   WebSocket? _ws;
   bool _running = false;
@@ -60,8 +71,7 @@ class FoxgloveClient extends ChangeNotifier {
     final generation = _generation;
     _setLink(Link.connecting);
     try {
-      final ws = await WebSocket.connect(url, protocols: ['foxglove.sdk.v1'])
-          .timeout(const Duration(seconds: 3));
+      final ws = await WebSocket.connect(url, protocols: ['foxglove.sdk.v1']).timeout(const Duration(seconds: 3));
       if (generation != _generation) {
         ws.close();
         return;
@@ -80,6 +90,8 @@ class FoxgloveClient extends ChangeNotifier {
   void _onClosed(int generation) {
     if (generation != _generation) return;
     _ws = null;
+    _cameraChannel = null;
+    _cameraSubscribed = false;
     _setLink(Link.disconnected);
     if (_running) {
       _retry?.cancel();
@@ -103,16 +115,33 @@ class FoxgloveClient extends ChangeNotifier {
           _send({
             'op': 'advertise',
             'channels': [
-              {'id': _chCmd, 'topic': '/teleop/phone/cmd_vel', 'encoding': 'json',
-               'schemaName': 'geometry_msgs/msg/Twist'},
-              {'id': _chMode, 'topic': '/teleop/phone/set_mode', 'encoding': 'json',
-               'schemaName': 'std_msgs/msg/String'},
+              {
+                'id': _chCmd,
+                'topic': '/teleop/phone/cmd_vel',
+                'encoding': 'json',
+                'schemaName': 'geometry_msgs/msg/Twist'
+              },
+              {
+                'id': _chMode,
+                'topic': '/teleop/phone/set_mode',
+                'encoding': 'json',
+                'schemaName': 'std_msgs/msg/String'
+              },
             ],
           });
         case 'advertise':
           for (final c in msg['channels'] as List) {
             if (c['topic'] == '/teleop/state') {
-              _send({'op': 'subscribe', 'subscriptions': [{'id': _subState, 'channelId': c['id']}]});
+              _send({
+                'op': 'subscribe',
+                'subscriptions': [
+                  {'id': _subState, 'channelId': c['id']}
+                ]
+              });
+            } else if (c['topic'] == cameraTopic) {
+              _cameraChannel = c['id'] as int;
+              _cameraSubscribed = false;
+              _syncCamera();
             }
           }
       }
@@ -122,11 +151,75 @@ class FoxgloveClient extends ChangeNotifier {
     // std_msgs/String in CDR: 4-byte encapsulation header, u32 length incl. NUL, bytes
     final b = data as Uint8List;
     final v = ByteData.sublistView(b);
-    if (b.length < 21 || v.getUint8(0) != 1 || v.getUint32(1, Endian.little) != _subState) return;
+    if (b.length < 21 || v.getUint8(0) != 1) return;
+    final sub = v.getUint32(1, Endian.little);
+    if (sub == _subCamera) {
+      _onCameraFrame(b);
+      return;
+    }
+    if (sub != _subState) return;
     final len = v.getUint32(17, Endian.little);
     try {
       state = RobotState(jsonDecode(utf8.decode(b.sublist(21, 21 + len - 1))) as Map<String, dynamic>);
       notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Turn the camera stream on or off (the camera page being visible).
+  void watchCamera(bool on) {
+    _wantCamera = on;
+    _syncCamera();
+    if (!on) {
+      cameraFrame.value = null;
+      _frameTimes.clear();
+    }
+  }
+
+  void _syncCamera() {
+    final channel = _cameraChannel;
+    if (_ws == null || channel == null || _wantCamera == _cameraSubscribed) return;
+    if (_wantCamera) {
+      _send({
+        'op': 'subscribe',
+        'subscriptions': [
+          {'id': _subCamera, 'channelId': channel}
+        ]
+      });
+    } else {
+      _send({
+        'op': 'unsubscribe',
+        'subscriptionIds': [_subCamera]
+      });
+    }
+    _cameraSubscribed = _wantCamera;
+  }
+
+  /// Frames per second over the last 2 s.
+  double get cameraFps {
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 2));
+    _frameTimes.removeWhere((t) => t.isBefore(cutoff));
+    return _frameTimes.length / 2;
+  }
+
+  bool get cameraAvailable => _cameraChannel != null;
+
+  // sensor_msgs/CompressedImage in CDR, after the 13-byte messageData header and the
+  // 4-byte encapsulation header: stamp (8), frame_id (u32 len + bytes), format (aligned
+  // to 4), data (aligned u32 len + bytes). Alignment is relative to the CDR body.
+  void _onCameraFrame(Uint8List b) {
+    if (!_wantCamera) return;
+    try {
+      final body = ByteData.sublistView(b, 17);
+      var off = 8;
+      int skipString(int off) => off + 4 + body.getUint32(off, Endian.little);
+      off = skipString(off); // frame_id
+      off = (off + 3) & ~3;
+      off = skipString(off); // format
+      off = (off + 3) & ~3;
+      final n = body.getUint32(off, Endian.little);
+      final start = 17 + off + 4;
+      cameraFrame.value = Uint8List.sublistView(b, start, start + n);
+      _frameTimes.add(DateTime.now());
     } catch (_) {}
   }
 

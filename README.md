@@ -15,6 +15,15 @@ orintwo over the Foxglove WebSocket protocol (`foxglove.sdk.v1`). It is a submod
   and Android would otherwise route the app over mobile data.
 - Keeps the screen on, vibrates on STOP, remembers the robot address (default
   `10.42.0.1`, orintwo's access point; tap the address at the bottom to change it).
+- Landscape only (either way up), full screen. Two pages:
+  - **Controls:** status, Autonomous / Manual / Stop and STOP on the left; joystick on
+    the right.
+  - **Camera** (swipe left or *Camera ›*): the robot's camera full screen, with two
+    transparent controls. On the left, a hold-to-drive switch: the joystick counts only
+    while it's held. On the right, the joystick. *‹ Controls* goes back; swiping is off
+    on this page so steering can't turn the page.
+  - `/teleop/camera/compressed` (app_teleop's `teleop_camera`, the ZED) is subscribed
+    only while the camera page is showing.
 
 ## Build
 
