@@ -11,11 +11,21 @@ orintwo over the Foxglove WebSocket protocol (`foxglove.sdk.v1`). It is a submod
   stops the rover.
 - `/teleop/phone/set_mode`: Autonomous / Manual / Stop. STOP fires on press, not release.
 - Shows `/teleop/state`, the mode the robot is actually in, not what the app last sent.
+- `/teleop/phone/rover_cmd` / `/teleop/rover_state`: arms the rover's `robot_control`
+  and switches its modes through orintwo, which presses `/joy` for it and tracks
+  (guesses) its state (navigation_ws #23).
 - Pins its sockets to Wi-Fi (`MainActivity.kt`): orintwo's access point has no internet,
   and Android would otherwise route the app over mobile data.
 - Keeps the screen on, vibrates on STOP, remembers the robot address (default
   `10.42.0.1`, orintwo's access point; tap the address at the bottom to change it).
-- Landscape only (either way up), full screen. Two pages:
+- Landscape only (either way up), full screen. Three pages, opening on Controls:
+  - **Wheels** (swipe right or *‹ Wheels*): robot_control's modes as orintwo tracks them
+    (input, steering, motion, last command; "⚠ GUESSED STATE" while `tracked`) and the
+    mux state on the left. On the right: *Input → /cmd_vel*, *Crab | Ackermann*,
+    *Resume*, *HOLD TO ARM* (hold 1 s: mux to Manual, then `arm`), *Reset* (after
+    robot_control restarts, with a confirm) and the same STOP. The buttons are off, with
+    the reason, without a link or when the mux source isn't `phone`; STOP always works.
+    A drag that starts on a button doesn't turn the page.
   - **Controls:** status, Autonomous / Manual / Stop and STOP on the left; joystick on
     the right.
   - **Camera** (swipe left or *Camera ›*): the robot's camera full screen, with two
@@ -37,5 +47,7 @@ orintwo then serves the APK at `http://10.42.0.1:8080/rover-teleop.apk`. The deb
 signing key lives in the `navws_flutter_cache` Docker volume on the machine that builds;
 an APK signed with a different key won't install over the old one (uninstall first).
 
-`lib/foxglove.dart` is the protocol client, `lib/main.dart` the UI. The iOS project is
+`lib/foxglove.dart` is the protocol client, `lib/main.dart` the UI,
+`test/wheels_page_test.dart` widget tests for the wheels page (`flutter test`, in the
+same builder container). The iOS project is
 generated but has never been built (needs macOS).

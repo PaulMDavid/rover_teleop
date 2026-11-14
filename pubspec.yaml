@@ -1,7 +1,7 @@
 name: rover_teleop
 description: Rover teleop over foxglove_bridge (navigation_ws app_teleop).
 publish_to: 'none'
-version: 1.2.0+4
+version: 1.3.1+6
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
@@ -12,6 +12,8 @@ dependencies:
   shared_preferences: ^2.3.2
 
 dev_dependencies:
+  flutter_test:
+    sdk: flutter
   flutter_lints: ^4.0.0
 
 flutter:
