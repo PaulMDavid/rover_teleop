@@ -3,12 +3,15 @@
 // it, locking the screen or losing Wi-Fi stops the stream, and the robot's deadman
 // (0.5 s) stops the rover. Everything shown comes from the robot's /teleop/state.
 //
-// Three pages, opening on the controls. Swipe right (or "‹ Wheels") for the wheels page:
+// Four pages, [system, wheels, controls, camera], opening on the controls. Swipe right
+// (or "‹ Wheels") for the wheels page:
 // arms the rover and switches robot_control's modes through orintwo (/teleop/phone/rover_cmd)
 // and shows the modes orintwo tracks (/teleop/rover_state). Swipe left (or "Camera ›") for
 // the camera, where the ZED image fills the screen under two transparent controls: a
 // hold-to-drive switch on the left and the joystick on the right. The camera streams only
-// while its page is showing.
+// while its page is showing. Swipe right from the wheels page (or "‹ System") for the
+// system page: brings the robots up, stops them, recenters the wheels over ssh to orintwo
+// (phone_ctl.sh, navigation_ws #27; system_page.dart, phone_ctl.dart).
 //
 // Landscape only (manifest: sensorLandscape); the orientation never changes at runtime.
 import 'dart:async';
@@ -16,9 +19,13 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'foxglove.dart';
+import 'phone_ctl.dart';
+
+part 'system_page.dart';
 
 const defaultHost = '10.42.0.1'; // orintwo's access point
 const bridgePort = 8765;
@@ -47,16 +54,22 @@ void main() {
 }
 
 class TeleopPage extends StatefulWidget {
-  const TeleopPage({super.key});
+  const TeleopPage({super.key, this.phoneCtl});
+
+  /// The ssh layer for the system page; null = ssh to orintwo (tests pass a fake).
+  final PhoneCtl? phoneCtl;
 
   @override
   State<TeleopPage> createState() => _TeleopPageState();
 }
 
 class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
-  static const wheelsPage = 0, controlsPage = 1, cameraPage = 2;
+  // left to right; the index is the PageView page
+  static const systemPage = 0, wheelsPage = 1, controlsPage = 2, cameraPage = 3;
 
   final client = FoxgloveClient();
+  late final system = SystemController(widget.phoneCtl ?? SshPhoneCtl(hosts: _sshHosts));
+  String sshHost = ''; // typed on the system page; tried after orintwo.local
   final pages = PageController(initialPage: controlsPage);
   Offset stick = Offset.zero; // x right, y up, both -1..1
   bool deadman = false; // camera page: joystick counts only while this is held
@@ -75,6 +88,7 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
     wifi.invokeMethod('bindToWifi').catchError((_) {});
     SharedPreferences.getInstance().then((prefs) {
       host = prefs.getString('host') ?? defaultHost;
+      sshHost = prefs.getString('ssh_host') ?? '';
       client.start(_url);
       setState(() {});
     });
@@ -82,6 +96,9 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
   }
 
   String get _url => 'ws://$host:$bridgePort';
+
+  /// orintwo.local, then a typed address, then the WebSocket's host.
+  List<String> _sshHosts() => {sshDefaultHost, if (sshHost.isNotEmpty) sshHost, host}.toList();
 
   void _onClient() => setState(() {
         if (pendingMode == client.state?.mode) pendingMode = null;
@@ -91,6 +108,7 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     sender?.cancel();
+    system.dispose();
     client
       ..removeListener(_onClient) // stop() notifies; this State is already going away
       ..stop();
@@ -156,6 +174,31 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
     client.setMode('stop');
   }
 
+  Future<void> _editSshHost() async {
+    final ctl = TextEditingController(text: sshHost);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('orintwo ssh address'),
+        content: TextField(
+          controller: ctl,
+          autofocus: true,
+          keyboardType: TextInputType.url,
+          decoration: InputDecoration(
+              hintText: 'e.g. 10.144.2.17',
+              helperText: 'tried after $sshDefaultHost, before the robot address ($host); empty: none'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(c, ctl.text.trim()), child: const Text('Save')),
+        ],
+      ),
+    );
+    if (result == null) return;
+    (await SharedPreferences.getInstance()).setString('ssh_host', result);
+    setState(() => sshHost = result);
+  }
+
   Future<void> _editHost() async {
     final ctl = TextEditingController(text: host);
     final result = await showDialog<String>(
@@ -190,7 +233,12 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
           onPageChanged: _onPage,
           // swipe to the camera; back only via "‹ Controls", so steering can't turn the page
           physics: page == cameraPage ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
-          children: [_wheels(), _controls(), _camera()],
+          children: [
+            SystemPage(ctl: system, onWheels: () => _goTo(wheelsPage), onEditHost: _editSshHost),
+            _wheels(),
+            _controls(),
+            _camera(),
+          ],
         ),
       );
 
@@ -322,6 +370,7 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
         onArm: _arm,
         onStop: _stop,
         onControls: () => _goTo(controlsPage),
+        onSystem: () => _goTo(systemPage),
       );
 
   Widget _camera() {
@@ -649,7 +698,7 @@ class StopButton extends StatelessWidget {
       );
 }
 
-/// Wheels page (swipe right from the controls): robot_control's modes as orintwo tracks
+/// Wheels page (swipe right from the controls, left from the system page): robot_control's modes as orintwo tracks
 /// them (/teleop/rover_state) and the mux state on the left, buttons that send
 /// /teleop/phone/rover_cmd on the right. orintwo accepts rover_cmd only while the mux's
 /// source is `phone`, so the buttons are off otherwise; STOP always works.
@@ -665,6 +714,7 @@ class WheelsPage extends StatelessWidget {
     required this.onArm,
     required this.onStop,
     this.onControls,
+    this.onSystem,
   });
 
   final bool connected;
@@ -680,6 +730,7 @@ class WheelsPage extends StatelessWidget {
   final VoidCallback onArm;
   final VoidCallback onStop;
   final VoidCallback? onControls;
+  final VoidCallback? onSystem;
 
   static const _gap = SizedBox(height: 6);
 
@@ -700,6 +751,7 @@ class WheelsPage extends StatelessWidget {
     void Function()? send(String cmd) => enabled ? () => onCommand(cmd) : null;
 
     final header = Row(children: [
+      if (onSystem != null) TextButton(onPressed: onSystem, child: const Text('‹ System')),
       const Text('WHEELS', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: 2)),
       const SizedBox(width: 16),
       Container(width: 10, height: 10, decoration: BoxDecoration(color: linkColor, shape: BoxShape.circle)),
