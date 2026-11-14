@@ -13,11 +13,14 @@
 // system page: brings the robots up, stops them, recenters the wheels over ssh to orintwo
 // (phone_ctl.sh, navigation_ws #27; system_page.dart, phone_ctl.dart).
 //
-// The wheels column is a vertical PageView, [autonav, wheels] (Record goes below wheels
-// later, #29): swipe down from the wheels page (or "⌃ Autonav") for the Autonav page,
-// the map with Nav2 goals through orintwo's nav_relay (navigation_ws #30; autonav_page.dart,
-// nav.dart). Its map takes one-finger taps and drags, so the Autonav page doesn't turn:
-// back only via "⌄ Wheels".
+// The wheels column is a vertical PageView, [autonav, wheels, record]: swipe down from the
+// wheels page (or "⌃ Autonav") for the Autonav page, the map with Nav2 goals through
+// orintwo's nav_relay (navigation_ws #30; autonav_page.dart, nav.dart). Its map takes
+// one-finger taps and drags, so the Autonav page doesn't turn: back only via "⌄ Wheels".
+// Swipe up from the wheels page (or "⌄ Record") for the Record page: bags on orintwo
+// through phone_ctl.sh record over the System page's ssh (navigation_ws #29;
+// record_page.dart, record.dart). Its big STOP stops the recording; the mux STOP is the
+// small "MUX STOP" in its header. Back via a swipe down or "⌃ Wheels".
 //
 // Landscape only (manifest: sensorLandscape); the orientation never changes at runtime.
 import 'dart:async';
@@ -32,8 +35,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'foxglove.dart';
 import 'nav.dart';
 import 'phone_ctl.dart';
+import 'record.dart';
 
 part 'autonav_page.dart';
+part 'record_page.dart';
 part 'system_page.dart';
 
 const defaultHost = '10.42.0.1'; // orintwo's access point
@@ -79,11 +84,14 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
   // left to right; the index is the PageView page. wheelsPage is the wheels column.
   static const systemPage = 0, wheelsPage = 1, controlsPage = 2, cameraPage = 3;
 
-  // the wheels column, top to bottom (#29 adds recordRow = 2 below wheels)
-  static const autonavRow = 0, wheelsRow = 1;
+  // the wheels column, top to bottom
+  static const autonavRow = 0, wheelsRow = 1, recordRow = 2;
 
   late final client = widget.client ?? FoxgloveClient();
-  late final system = SystemController(widget.phoneCtl ?? SshPhoneCtl(hosts: _sshHosts));
+  // one ssh layer (key, host order, host-key pin) for the system and record pages
+  late final PhoneCtl phoneCtl = widget.phoneCtl ?? SshPhoneCtl(hosts: _sshHosts);
+  late final system = SystemController(phoneCtl);
+  late final record = RecordController(phoneCtl);
   String sshHost = ''; // typed on the system page; tried after orintwo.local
   final pages = PageController(initialPage: controlsPage);
   final rows = PageController(initialPage: wheelsRow);
@@ -126,6 +134,7 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     sender?.cancel();
     system.dispose();
+    record.dispose();
     pages.dispose();
     rows.dispose();
     client
@@ -148,10 +157,11 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
 
   bool get _onAutonav => page == wheelsPage && row == autonavRow;
 
-  /// Camera and Autonav topics only while their page shows.
+  /// Camera and Autonav topics, and `record status`, only while their page shows.
   void _watch() {
     client.watchCamera(foreground && page == cameraPage);
     client.watchNav(foreground && _onAutonav);
+    record.setVisible(foreground && page == wheelsPage && row == recordRow);
   }
 
   void _onPage(int p) {
@@ -295,7 +305,7 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
               scrollDirection: Axis.vertical,
               onPageChanged: _onRow,
               physics: row == autonavRow ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
-              children: [_autonav(), _wheels()],
+              children: [_autonav(), _wheels(), _record()],
             ),
             _controls(),
             _camera(),
@@ -433,7 +443,10 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
         onControls: () => _goTo(controlsPage),
         onSystem: () => _goTo(systemPage),
         onAutonav: () => _goToRow(autonavRow),
+        onRecord: () => _goToRow(recordRow),
       );
+
+  Widget _record() => RecordPage(ctl: record, onStop: _stop, onWheels: () => _goToRow(wheelsRow));
 
   Widget _autonav() => AutonavPage(
         connected: client.link == Link.connected,
@@ -757,13 +770,15 @@ class _JoystickPainter extends CustomPainter {
   bool shouldRepaint(_JoystickPainter old) => old.value != value || old.radius != radius;
 }
 
-/// The mux STOP (set_mode stop), shared by the controls and wheels pages. Fires on press,
-/// not release.
+/// The mux STOP (set_mode stop), shared by the controls, wheels and autonav pages (small,
+/// as "MUX STOP", in the record page's header). Fires on press, not release.
 class StopButton extends StatelessWidget {
-  const StopButton({super.key, required this.onStop, this.height = 72});
+  const StopButton({super.key, required this.onStop, this.height = 72, this.label = 'STOP', this.fontSize = 26});
 
   final VoidCallback onStop;
   final double height;
+  final String label;
+  final double fontSize;
 
   @override
   Widget build(BuildContext context) => Listener(
@@ -774,9 +789,11 @@ class StopButton extends StatelessWidget {
           decoration: BoxDecoration(
             color: bad,
             borderRadius: BorderRadius.circular(height / 2),
-            border: Border.all(color: const Color(0xFF7F1D1D), width: 4),
+            border: Border.all(color: const Color(0xFF7F1D1D), width: height < 40 ? 2 : 4),
           ),
-          child: const Text('STOP', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, letterSpacing: 3)),
+          child: Text(label,
+              maxLines: 1,
+              style: TextStyle(fontSize: fontSize, fontWeight: FontWeight.w800, letterSpacing: fontSize < 20 ? 1 : 3)),
         ),
       );
 }
@@ -799,6 +816,7 @@ class WheelsPage extends StatelessWidget {
     this.onControls,
     this.onSystem,
     this.onAutonav,
+    this.onRecord,
   });
 
   final bool connected;
@@ -816,6 +834,7 @@ class WheelsPage extends StatelessWidget {
   final VoidCallback? onControls;
   final VoidCallback? onSystem;
   final VoidCallback? onAutonav;
+  final VoidCallback? onRecord;
 
   static const _gap = SizedBox(height: 6);
 
@@ -963,7 +982,21 @@ class WheelsPage extends StatelessWidget {
           const SizedBox(height: 4),
           Expanded(
             child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              Expanded(flex: 5, child: SingleChildScrollView(child: status)),
+              // "⌄ Record" at the bottom edge, where Record is (no room left in the header)
+              Expanded(
+                flex: 5,
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Expanded(child: SingleChildScrollView(child: status)),
+                  if (onRecord != null)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: SizedBox(
+                        height: 32,
+                        child: TextButton(onPressed: onRecord, style: compact, child: const Text('⌄ Record')),
+                      ),
+                    ),
+                ]),
+              ),
               const SizedBox(width: 16),
               Expanded(flex: 4, child: buttons),
             ]),
