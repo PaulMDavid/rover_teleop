@@ -40,7 +40,15 @@ orintwo over the Foxglove WebSocket protocol (`foxglove.sdk.v1`). It is a submod
     *Resume*, *HOLD TO ARM* (hold 1 s: mux to Manual, then `arm`), *Reset* (after
     robot_control restarts, with a confirm) and the same STOP. The buttons are off, with
     the reason, without a link or when the mux source isn't `phone`; STOP always works.
-    A drag that starts on a button doesn't turn the page.
+    A drag that starts on a button doesn't turn the page. The Wheels column also goes up
+    and down: *Autonav* above (Nav2 goals, navigation_ws #30), *Record* below.
+  - **Record** (swipe up from Wheels or *⌄ Record*; navigation_ws #29): starts and stops
+    a bag on orintwo through `phone_ctl.sh record …` over the System page's ssh. Preset
+    (`drive` preselected), its groups as checkboxes, *All topics…* (`record topics`:
+    search, type, Hz, MB/s; ticks become `+/topic` / `-/topic` on START). *● START*,
+    *■ STOP* (asks first; stops the recording only) and the live `record status` while
+    the page shows: elapsed, bag, size, rate, free SSD, hours left, silent topics,
+    unclosed bags. The rover's mux STOP is the small *MUX STOP* in the header.
   - **Controls:** status, Autonomous / Manual / Stop and STOP on the left; joystick on
     the right.
   - **Camera** (swipe left or *Camera ›*): the robot's camera full screen, with two
@@ -64,7 +72,8 @@ an APK signed with a different key won't install over the old one (uninstall fir
 
 `lib/foxglove.dart` is the protocol client, `lib/main.dart` the UI,
 `lib/phone_ctl.dart` the ssh layer and the system page's state, `lib/system_page.dart`
-its UI, `test/wheels_page_test.dart` and `test/system_page_test.dart` widget tests (the
-system page's with a fake ssh layer) (`flutter test`, in the
+its UI, `lib/record.dart` / `lib/record_page.dart` the record page's state and UI,
+`test/wheels_page_test.dart`, `test/system_page_test.dart` and
+`test/record_page_test.dart` widget tests (the last two with a fake ssh layer) (`flutter test`, in the
 same builder container). The iOS project is
 generated but has never been built (needs macOS).
