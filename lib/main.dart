@@ -731,9 +731,15 @@ class WheelsPage extends StatelessWidget {
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         _title('ROBOT_CONTROL', rs == null ? 'no state' : null),
-        _row('Input', rs?.input?.toUpperCase(), color: rs?.input == 'autonomous' ? ok : null),
+        // robot_control's "autonomous" input means /cmd_vel, i.e. whatever the mux outputs
+        // (the phone joystick in mux manual). Not the mux's autonomous (= Nav2) mode.
+        _row('Input', {'autonomous': '/cmd_vel (mux)', 'manual': 'manual 5 %'}[rs?.input] ?? rs?.input,
+            color: rs?.input == 'autonomous' ? ok : null),
         _row('Steering', rs?.steering?.toUpperCase()),
-        _row('Motion', rs?.motion?.toUpperCase(), color: {'running': ok, 'stopped': bad}[rs?.motion]),
+        // robot_control's own stop: only after it (re)starts, left by ARM. The red STOP is the
+        // mux's and shows in the MUX section.
+        _row('Motion', {'running': 'RUNNING', 'stopped': 'HELD (until ARM)'}[rs?.motion] ?? rs?.motion,
+            color: {'running': ok, 'stopped': bad}[rs?.motion]),
         _row('Last', rs?.lastCmd == null ? null : '${rs!.lastCmd}${age == null ? '' : ' · ${age.round()} s'}'),
         if (rs?.rejected != null)
           Padding(
@@ -743,7 +749,8 @@ class WheelsPage extends StatelessWidget {
           ),
         const Divider(color: line, height: 14),
         _title('MUX', st == null ? 'no state' : null),
-        _row('Mode', st == null ? null : '${st.mode} · ${st.source}', color: st == null ? null : _modeColor(st.mode)),
+        _row('Mode', st == null ? null : '${st.mode.toUpperCase()} · ${st.source}',
+            color: st == null ? null : _modeColor(st.mode)),
         _row(
             'Output',
             st == null
@@ -768,8 +775,6 @@ class WheelsPage extends StatelessWidget {
         ]),
       ),
       _gap,
-      Expanded(child: _NoPageSwipe(child: _button('Resume', send('resume')))),
-      _gap,
       Expanded(child: _NoPageSwipe(child: HoldToArm(enabled: enabled, onArmed: onArm))),
       _gap,
       Align(
@@ -785,7 +790,7 @@ class WheelsPage extends StatelessWidget {
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               ),
-              child: const Text('Reset'),
+              child: const Text('robot_control restarted'),
             ),
           ),
         ),
@@ -829,7 +834,7 @@ class WheelsPage extends StatelessWidget {
             'It sends nothing to the rover.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Reset')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Yes, reset guess')),
         ],
       ),
     );

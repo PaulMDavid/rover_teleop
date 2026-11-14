@@ -74,11 +74,11 @@ void main() {
     final h = Harness();
     await t.pumpWidget(h.page(robot: mux(), rov: rover(rejected: 'wrong source')));
     expect(find.text('⚠ GUESSED STATE'), findsOneWidget);
-    expect(find.text('AUTONOMOUS'), findsOneWidget);
+    expect(find.text('/cmd_vel (mux)'), findsOneWidget);
     expect(find.text('CRAB'), findsOneWidget);
     expect(find.text('RUNNING'), findsOneWidget);
     expect(find.text('arm · 4 s'), findsOneWidget);
-    expect(find.text('manual · phone'), findsOneWidget);
+    expect(find.text('MANUAL · phone'), findsOneWidget);
     expect(find.text('vx 0.20  wz 0.35  max 1.0'), findsOneWidget);
     expect(find.text('Rejected: wrong source'), findsOneWidget);
 
@@ -101,18 +101,18 @@ void main() {
     await t.tap(find.text('Input → /cmd_vel'));
     await t.tap(find.text('Ackermann'));
     await t.tap(find.text('Crab'));
-    await t.tap(find.text('Resume'));
-    expect(h.cmds, ['input_auto', 'steer_ackermann', 'steer_crab', 'resume']);
+    expect(find.text('Resume'), findsNothing); // ARM covers it; the only stop is the mux STOP
+    expect(h.cmds, ['input_auto', 'steer_ackermann', 'steer_crab']);
 
-    await t.tap(find.text('Reset'));
+    await t.tap(find.text('robot_control restarted'));
     await t.pumpAndSettle();
     expect(find.text('robot_control restarted?'), findsOneWidget);
     await t.tap(find.text('Cancel'));
     await t.pumpAndSettle();
-    expect(h.cmds.last, 'resume');
-    await t.tap(find.text('Reset'));
+    expect(h.cmds.last, 'steer_crab');
+    await t.tap(find.text('robot_control restarted'));
     await t.pumpAndSettle();
-    await t.tap(find.widgetWithText(FilledButton, 'Reset'));
+    await t.tap(find.widgetWithText(FilledButton, 'Yes, reset guess'));
     await t.pumpAndSettle();
     expect(h.cmds.last, 'reset');
   });
@@ -155,7 +155,7 @@ void main() {
     await t.pumpWidget(h.page(robot: mux(source: 'ground'), rov: rover()));
     expect(find.textContaining('takes commands from "ground"'), findsOneWidget);
     await t.tap(find.text('Input → /cmd_vel'));
-    await t.tap(find.text('Resume'));
+    await t.tap(find.text('Ackermann'));
     final g = await t.startGesture(t.getCenter(find.text('HOLD TO ARM')));
     await t.pump();
     await t.pump(const Duration(milliseconds: 600));
@@ -173,7 +173,7 @@ void main() {
     final h = Harness();
     await t.pumpWidget(h.page(connected: false));
     expect(find.text('No link to the robot.'), findsOneWidget);
-    await t.tap(find.text('Resume'));
+    await t.tap(find.text('Input → /cmd_vel'));
     expect(h.cmds, isEmpty);
     await t.tap(find.text('STOP'));
     expect(h.stops, 1);
@@ -194,7 +194,7 @@ void main() {
     expect(find.text('Camera ›'), findsNothing);
 
     // a horizontal drag starting on a button doesn't turn the page
-    await t.drag(find.text('Resume'), const Offset(-500, 0));
+    await t.drag(find.text('Ackermann'), const Offset(-500, 0));
     await t.pumpAndSettle(const Duration(milliseconds: 100));
     expect(find.text('WHEELS'), findsOneWidget);
 
