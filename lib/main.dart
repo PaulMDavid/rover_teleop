@@ -3,7 +3,7 @@
 // it, locking the screen or losing Wi-Fi stops the stream, and the robot's deadman
 // (0.5 s) stops the rover. Everything shown comes from the robot's /teleop/state.
 //
-// Four pages, [system, wheels, controls, camera], opening on the controls. Swipe right
+// Four columns, [system, wheels, controls, camera], opening on the controls. Swipe right
 // (or "‹ Wheels") for the wheels page:
 // arms the rover and switches robot_control's modes through orintwo (/teleop/phone/rover_cmd)
 // and shows the modes orintwo tracks (/teleop/rover_state). Swipe left (or "Camera ›") for
@@ -13,9 +13,16 @@
 // system page: brings the robots up, stops them, recenters the wheels over ssh to orintwo
 // (phone_ctl.sh, navigation_ws #27; system_page.dart, phone_ctl.dart).
 //
+// The wheels column is a vertical PageView, [autonav, wheels] (Record goes below wheels
+// later, #29): swipe down from the wheels page (or "⌃ Autonav") for the Autonav page,
+// the map with Nav2 goals through orintwo's nav_relay (navigation_ws #30; autonav_page.dart,
+// nav.dart). Its map takes one-finger taps and drags, so the Autonav page doesn't turn:
+// back only via "⌄ Wheels".
+//
 // Landscape only (manifest: sensorLandscape); the orientation never changes at runtime.
 import 'dart:async';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -23,8 +30,10 @@ import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'foxglove.dart';
+import 'nav.dart';
 import 'phone_ctl.dart';
 
+part 'autonav_page.dart';
 part 'system_page.dart';
 
 const defaultHost = '10.42.0.1'; // orintwo's access point
@@ -54,23 +63,31 @@ void main() {
 }
 
 class TeleopPage extends StatefulWidget {
-  const TeleopPage({super.key, this.phoneCtl});
+  const TeleopPage({super.key, this.phoneCtl, this.client});
 
   /// The ssh layer for the system page; null = ssh to orintwo (tests pass a fake).
   final PhoneCtl? phoneCtl;
+
+  /// The bridge client; null = a real one (tests pass a fake).
+  final FoxgloveClient? client;
 
   @override
   State<TeleopPage> createState() => _TeleopPageState();
 }
 
 class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
-  // left to right; the index is the PageView page
+  // left to right; the index is the PageView page. wheelsPage is the wheels column.
   static const systemPage = 0, wheelsPage = 1, controlsPage = 2, cameraPage = 3;
 
-  final client = FoxgloveClient();
+  // the wheels column, top to bottom (#29 adds recordRow = 2 below wheels)
+  static const autonavRow = 0, wheelsRow = 1;
+
+  late final client = widget.client ?? FoxgloveClient();
   late final system = SystemController(widget.phoneCtl ?? SshPhoneCtl(hosts: _sshHosts));
   String sshHost = ''; // typed on the system page; tried after orintwo.local
   final pages = PageController(initialPage: controlsPage);
+  final rows = PageController(initialPage: wheelsRow);
+  int row = wheelsRow;
   Offset stick = Offset.zero; // x right, y up, both -1..1
   bool deadman = false; // camera page: joystick counts only while this is held
   int page = controlsPage;
@@ -109,6 +126,8 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     sender?.cancel();
     system.dispose();
+    pages.dispose();
+    rows.dispose();
     client
       ..removeListener(_onClient) // stop() notifies; this State is already going away
       ..stop();
@@ -124,7 +143,15 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
         deadman = false;
       });
     }
+    _watch();
+  }
+
+  bool get _onAutonav => page == wheelsPage && row == autonavRow;
+
+  /// Camera and Autonav topics only while their page shows.
+  void _watch() {
     client.watchCamera(foreground && page == cameraPage);
+    client.watchNav(foreground && _onAutonav);
   }
 
   void _onPage(int p) {
@@ -133,7 +160,12 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
       stick = Offset.zero;
       deadman = false;
     });
-    client.watchCamera(p == cameraPage && foreground);
+    _watch();
+  }
+
+  void _onRow(int r) {
+    setState(() => row = r);
+    _watch();
   }
 
   void _send() {
@@ -164,6 +196,28 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
   }
 
   void _goTo(int p) => pages.animateToPage(p, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+
+  void _goToRow(int r) => rows.animateToPage(r, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+
+  /// GO: the mux to autonomous first (otherwise teleop_mux never passes Nav2's
+  /// /cmd_vel_auto on), then the goal once setMode's three repeats (0/80/160 ms) are out.
+  void _navGo(double x, double y, double yaw) {
+    HapticFeedback.mediumImpact();
+    setState(() => pendingMode = 'autonomous');
+    client.setMode('autonomous');
+    Future.delayed(const Duration(milliseconds: 300), () => client.navGoal(x, y, yaw));
+  }
+
+  /// CANCEL: cancel the goal, then the mux to stop.
+  void _navCancel() {
+    client.navCmd({'cmd': 'cancel'});
+    _stop();
+  }
+
+  void _navCmd(String cmd) {
+    HapticFeedback.selectionClick();
+    client.navCmd({'cmd': cmd});
+  }
 
   void _stop() {
     HapticFeedback.heavyImpact();
@@ -231,11 +285,18 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
         body: PageView(
           controller: pages,
           onPageChanged: _onPage,
-          // swipe to the camera; back only via "‹ Controls", so steering can't turn the page
-          physics: page == cameraPage ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
+          // swipe to the camera; back only via "‹ Controls", so steering can't turn the page.
+          // Same for Autonav (the map's gestures): back only via "⌄ Wheels".
+          physics: page == cameraPage || _onAutonav ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
           children: [
             SystemPage(ctl: system, onWheels: () => _goTo(wheelsPage), onEditHost: _editSshHost),
-            _wheels(),
+            PageView(
+              controller: rows,
+              scrollDirection: Axis.vertical,
+              onPageChanged: _onRow,
+              physics: row == autonavRow ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
+              children: [_autonav(), _wheels()],
+            ),
             _controls(),
             _camera(),
           ],
@@ -371,6 +432,24 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
         onStop: _stop,
         onControls: () => _goTo(controlsPage),
         onSystem: () => _goTo(systemPage),
+        onAutonav: () => _goToRow(autonavRow),
+      );
+
+  Widget _autonav() => AutonavPage(
+        connected: client.link == Link.connected,
+        linkText: _linkText,
+        linkColor: _linkColor,
+        robot: _fresh,
+        nav: client.navState,
+        map: client.navMap,
+        onGo: _navGo,
+        onCancel: _navCancel,
+        onNavUp: () => _navCmd('bringup_go'),
+        onNavStop: () => _navCmd('bringup_stop'),
+        onStop: _stop,
+        onWheels: () => _goToRow(wheelsRow),
+        updates: client,
+        liveNav: () => client.navState,
       );
 
   Widget _camera() {
@@ -504,8 +583,8 @@ Widget _chip(String label, String value, {Color? dot, Color? color}) => Containe
       ]),
     );
 
-/// Swallows horizontal drags that start on a control, so the PageView doesn't turn the
-/// page while someone is steering. Raw pointer events still reach the Listener inside.
+/// Swallows drags that start on a control, so neither PageView (pages left/right, the
+/// wheels column up/down) turns while someone is steering or pressing. Raw pointer events still reach the Listener inside.
 class _NoPageSwipe extends StatelessWidget {
   const _NoPageSwipe({required this.child});
 
@@ -513,7 +592,11 @@ class _NoPageSwipe extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) =>
-      GestureDetector(onHorizontalDragStart: (_) {}, behavior: HitTestBehavior.opaque, child: child);
+      GestureDetector(
+          onHorizontalDragStart: (_) {},
+          onVerticalDragStart: (_) {},
+          behavior: HitTestBehavior.opaque,
+          child: child);
 }
 
 /// Camera page, left thumb: the joystick drives only while this is held.
@@ -715,6 +798,7 @@ class WheelsPage extends StatelessWidget {
     required this.onStop,
     this.onControls,
     this.onSystem,
+    this.onAutonav,
   });
 
   final bool connected;
@@ -731,6 +815,7 @@ class WheelsPage extends StatelessWidget {
   final VoidCallback onStop;
   final VoidCallback? onControls;
   final VoidCallback? onSystem;
+  final VoidCallback? onAutonav;
 
   static const _gap = SizedBox(height: 6);
 
@@ -750,27 +835,38 @@ class WheelsPage extends StatelessWidget {
     final enabled = reason == null;
     void Function()? send(String cmd) => enabled ? () => onCommand(cmd) : null;
 
+    final compact = TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8));
     final header = Row(children: [
-      if (onSystem != null) TextButton(onPressed: onSystem, child: const Text('‹ System')),
+      if (onSystem != null) TextButton(onPressed: onSystem, style: compact, child: const Text('‹ System')),
       const Text('WHEELS', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: 2)),
-      const SizedBox(width: 16),
-      Container(width: 10, height: 10, decoration: BoxDecoration(color: linkColor, shape: BoxShape.circle)),
-      const SizedBox(width: 6),
-      Text(linkText, style: const TextStyle(color: dim)),
-      const SizedBox(width: 16),
-      if (rs != null && rs.tracked)
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-          decoration: BoxDecoration(
-            color: const Color(0xFF3B2A0A),
-            border: Border.all(color: warn),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: const Text('⚠ GUESSED STATE',
-              style: TextStyle(color: warn, fontWeight: FontWeight.w700, letterSpacing: .5)),
-        ),
-      const Spacer(),
-      if (onControls != null) TextButton(onPressed: onControls, child: const Text('Controls ›')),
+      const SizedBox(width: 12),
+      // link text and banner give way on a narrow phone
+      Expanded(
+        child: Row(children: [
+          Container(width: 10, height: 10, decoration: BoxDecoration(color: linkColor, shape: BoxShape.circle)),
+          const SizedBox(width: 6),
+          Flexible(child: Text(linkText, overflow: TextOverflow.ellipsis, style: const TextStyle(color: dim))),
+          const SizedBox(width: 12),
+          if (rs != null && rs.tracked)
+            Flexible(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF3B2A0A),
+                    border: Border.all(color: warn),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: const Text('⚠ GUESSED STATE',
+                      style: TextStyle(color: warn, fontWeight: FontWeight.w700, letterSpacing: .5)),
+                ),
+              ),
+            ),
+        ]),
+      ),
+      if (onAutonav != null) TextButton(onPressed: onAutonav, style: compact, child: const Text('⌃ Autonav')),
+      if (onControls != null) TextButton(onPressed: onControls, style: compact, child: const Text('Controls ›')),
     ]);
 
     final age = rs?.lastCmdAge;
