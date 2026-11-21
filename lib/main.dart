@@ -22,6 +22,13 @@
 // record_page.dart, record.dart). Its big STOP stops the recording; the mux STOP is the
 // small "MUX STOP" in its header. Back via a swipe down or "⌃ Wheels".
 //
+// Driving (navigation_ws #37): to a mux with gears (/teleop/state has `gears`) the app sends
+// the normalized joystick on /teleop/phone/stick and the robot does the rest (gear speed,
+// ramp, speed-dependent steering limit); the camera page shifts with ▲ / ▼ above the
+// joystick (/teleop/phone/gear) and shows km/h above the deadman. The app has no cmd_vel
+// path: to an older mux (no `gear` in /teleop/state) it sends nothing, the joysticks are off
+// and a warning says to update orintwo.
+//
 // Landscape only (manifest: sensorLandscape); the orientation never changes at runtime.
 import 'dart:async';
 import 'dart:math';
@@ -40,6 +47,9 @@ import 'record.dart';
 part 'autonav_page.dart';
 part 'record_page.dart';
 part 'system_page.dart';
+
+/// /teleop/state without `gear`: a mux from before navigation_ws #37, which the app can't drive.
+const oldMuxWarning = 'orintwo runs an old mux without gears — update orintwo (sync + restart app_teleop)';
 
 const defaultHost = '10.42.0.1'; // orintwo's access point
 const bridgePort = 8765;
@@ -183,7 +193,16 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
     if (!foreground) return;
     final st = client.state;
     final usable = st != null && st.fresh && (page == controlsPage || deadman);
-    client.drive(usable ? stick.dy * st.maxLinear : 0, usable ? -stick.dx * st.maxAngular : 0);
+    // a mux without gears (before navigation_ws #37) gets nothing: the app has no cmd_vel path
+    if (st != null && !st.hasGears) return;
+    // stick.dx + = right; steer + = left. The mux scales it (gear speed, ramp, lateral limit).
+    client.stick(usable ? stick.dy : 0.0, usable ? -stick.dx : 0.0);
+  }
+
+  /// ▲ / ▼ on the camera page. The gear shown is the robot's, from /teleop/state.
+  void _shift(String dir) {
+    HapticFeedback.selectionClick();
+    client.shift(dir);
   }
 
   void _setMode(String mode) {
@@ -331,56 +350,67 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
 
   Widget _controls() {
     final st = _fresh;
-    final drivable = st != null && st.mode == 'manual' && st.source == 'phone';
+    final drivable = st != null && st.hasGears && st.mode == 'manual' && st.source == 'phone';
 
     String? warning;
-    if (st != null && st.source != 'phone') {
+    if (st != null && !st.hasGears) {
+      warning = oldMuxWarning;
+    } else if (st != null && st.source != 'phone') {
       warning = 'The robot takes commands from "${st.source}". Only STOP works from the phone.';
     } else if (st != null && st.mode != 'manual') {
       warning = 'The joystick drives only in Manual.';
     }
 
+    // the part above STOP scrolls when a long warning wraps on a small phone, so STOP and
+    // the page links always stay on screen
     final status = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Row(children: [
-          Expanded(child: _chip('Link', _linkText, dot: _linkColor)),
-          const SizedBox(width: 8),
-          Expanded(child: _chip('Robot mode', st?.mode ?? '—', color: st == null ? null : _modeColor(st.mode))),
-        ]),
-        const SizedBox(height: 8),
-        Row(children: [
-          Expanded(child: _chip('Command source', st?.source ?? '—')),
-          const SizedBox(width: 8),
-          Expanded(
-              child: _chip(
-                  'Robot hears phone',
-                  st == null
-                      ? '—'
-                      : st.hearsPhone
-                          ? 'yes (${(st.phoneAge! * 1000).round()} ms)'
-                          : 'no')),
-        ]),
-        if (warning != null) ...[
+        Expanded(
+            child: SingleChildScrollView(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            Expanded(flex: 4, child: _chip('Link', _linkText, dot: _linkColor)),
+            const SizedBox(width: 8),
+            Expanded(
+                flex: 4, child: _chip('Robot mode', st?.mode ?? '—', color: st == null ? null : _modeColor(st.mode))),
+            const SizedBox(width: 8),
+            Expanded(flex: 3, child: _gearChip(st)),
+          ]),
           const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xFF3B2A0A),
-              border: Border.all(color: warn),
-              borderRadius: BorderRadius.circular(10),
+          Row(children: [
+            Expanded(child: _chip('Command source', st?.source ?? '—')),
+            const SizedBox(width: 8),
+            Expanded(
+                child: _chip(
+                    'Robot hears phone',
+                    st == null
+                        ? '—'
+                        : st.hearsPhone
+                            ? 'yes (${(st.phoneAge! * 1000).round()} ms)'
+                            : 'no')),
+          ]),
+          if (warning != null) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF3B2A0A),
+                border: Border.all(color: warn),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(warning, style: const TextStyle(color: Color(0xFFFDE68A), fontSize: 13)),
             ),
-            child: Text(warning, style: const TextStyle(color: Color(0xFFFDE68A), fontSize: 13)),
-          ),
-        ],
-        const SizedBox(height: 8),
-        Row(children: [
-          for (final m in ['autonomous', 'manual', 'stop']) ...[
-            if (m != 'autonomous') const SizedBox(width: 8),
-            Expanded(child: _modeButton(m, active: st?.mode == m)),
           ],
-        ]),
-        const Spacer(),
+          const SizedBox(height: 8),
+          Row(children: [
+            for (final m in ['autonomous', 'manual', 'stop']) ...[
+              if (m != 'autonomous') const SizedBox(width: 8),
+              Expanded(child: _modeButton(m, active: st?.mode == m)),
+            ],
+          ]),
+          const SizedBox(height: 8),
+        ]))),
         StopButton(onStop: _stop),
         Row(children: [
           TextButton(
@@ -390,7 +420,8 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
           Expanded(
             child: TextButton(
               onPressed: _editHost,
-              child: Text(client.url, style: const TextStyle(color: dim, fontSize: 12)),
+              child: Text(client.url,
+                  maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: dim, fontSize: 12)),
             ),
           ),
           TextButton.icon(
@@ -420,8 +451,7 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
                   onChanged: (v) => setState(() => stick = v),
                   readout: st == null
                       ? ''
-                      : 'v ${(stick.dy * st.maxLinear).toStringAsFixed(2)} m/s   '
-                          'ω ${(-stick.dx * st.maxAngular).toStringAsFixed(2)} rad/s',
+                      : 'throttle ${stick.dy.toStringAsFixed(2)}   steer ${(-stick.dx).toStringAsFixed(2)}',
                 ),
               ),
             ),
@@ -467,14 +497,16 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
 
   Widget _camera() {
     final st = _fresh;
-    final drivable = st != null && st.mode == 'manual' && st.source == 'phone';
+    final drivable = st != null && st.hasGears && st.mode == 'manual' && st.source == 'phone';
     final status = [
       _linkText,
       if (st != null) st.mode.toUpperCase(),
       if (client.cameraAvailable) '${client.cameraFps.toStringAsFixed(0)} fps',
     ].join('   ·   ');
     String? hint;
-    if (st != null && st.source != 'phone') {
+    if (st != null && !st.hasGears) {
+      hint = oldMuxWarning;
+    } else if (st != null && st.source != 'phone') {
       hint = 'Robot takes commands from "${st.source}"';
     } else if (st != null && st.mode != 'manual') {
       hint = 'Set Manual on the controls page to drive';
@@ -511,9 +543,26 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
             Icon(Icons.circle, size: 10, color: _linkColor),
             const SizedBox(width: 6),
             Text(status, style: _overlayText),
+            const SizedBox(width: 12),
             const Spacer(),
-            if (hint != null) Text(hint, style: _overlayText.copyWith(color: const Color(0xFFFDE68A))),
+            if (hint != null)
+              Flexible(
+                flex: 8,
+                child: Text(hint,
+                    maxLines: 2,
+                    textAlign: TextAlign.right,
+                    overflow: TextOverflow.ellipsis,
+                    style: _overlayText.copyWith(color: const Color(0xFFFDE68A))),
+              ),
           ]),
+        ),
+        // km/h above the deadman, gears above the joystick (navigation_ws #37)
+        Positioned(left: 32, bottom: 32 + 150 + 6, child: SpeedReadout(robot: st)),
+        Positioned(
+          right: 32,
+          bottom: 32 + 200 + 6,
+          width: 200,
+          child: GearControl(robot: st, enabled: st != null && st.source == 'phone', onShift: _shift),
         ),
         Positioned(
           left: 32,
@@ -570,6 +619,21 @@ class _TeleopPageState extends State<TeleopPage> with WidgetsBindingObserver {
   }
 }
 
+/// Controls page, compact: "2 · 1.1" (gear · km/h); "cmd" and dimmed when the speed is
+/// the commanded one; "none" for a mux without gears.
+Widget _gearChip(RobotState? st) {
+  final v = st?.speed;
+  final gear = st == null ? '—' : (st.hasGears ? '${st.gear}' : 'none');
+  final speed = v == null ? '—' : '${kmh(v.mps)}${v.measured ? '' : ' cmd'}';
+  return _chip('Gear · km/h', '$gear · $speed', color: v != null && !v.measured ? dim : null);
+}
+
+/// m/s → km/h, one decimal, never "-0.0".
+String kmh(double mps) {
+  final s = (mps * 3.6).toStringAsFixed(1);
+  return s == '-0.0' ? '0.0' : s;
+}
+
 Color _modeColor(String mode) => {'stop': bad, 'manual': accent, 'autonomous': ok}[mode] ?? Colors.white;
 
 Widget _chip(String label, String value, {Color? dot, Color? color}) => Container(
@@ -604,12 +668,132 @@ class _NoPageSwipe extends StatelessWidget {
   final Widget child;
 
   @override
-  Widget build(BuildContext context) =>
-      GestureDetector(
-          onHorizontalDragStart: (_) {},
-          onVerticalDragStart: (_) {},
-          behavior: HitTestBehavior.opaque,
-          child: child);
+  Widget build(BuildContext context) => GestureDetector(
+      onHorizontalDragStart: (_) {}, onVerticalDragStart: (_) {}, behavior: HitTestBehavior.opaque, child: child);
+}
+
+const _shadow = [Shadow(blurRadius: 4, color: Colors.black)];
+
+/// Camera page, above the deadman: the speed in km/h, big. Measured (/odom_wheels) when
+/// the mux has it; else the commanded speed, dimmed, with a "cmd" tag.
+class SpeedReadout extends StatelessWidget {
+  const SpeedReadout({super.key, required this.robot});
+
+  final RobotState? robot;
+
+  @override
+  Widget build(BuildContext context) {
+    final v = robot?.speed;
+    final measured = v?.measured ?? true;
+    final color = Colors.white.withOpacity(v == null || !measured ? .55 : .95);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.baseline,
+      textBaseline: TextBaseline.alphabetic,
+      children: [
+        Text(v == null ? '—' : kmh(v.mps),
+            key: const Key('speed-kmh'),
+            style: TextStyle(
+                color: color,
+                fontSize: 40,
+                fontWeight: FontWeight.w800,
+                fontFeatures: const [FontFeature.tabularFigures()],
+                shadows: _shadow)),
+        const SizedBox(width: 4),
+        Text('km/h', style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.w600, shadows: _shadow)),
+        if (v != null && !measured) ...[
+          const SizedBox(width: 6),
+          Container(
+            key: const Key('speed-cmd'),
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(.4),
+              border: Border.all(color: color),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text('cmd', style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// Camera page, above the joystick: ▼ [ gear ] ▲ and under it the gear's top speed in
+/// km/h (capped by max_linear) and "steering limited" while the mux narrows the steering.
+/// The gear shown is the robot's (/teleop/state). A mux without gears: a note only.
+class GearControl extends StatelessWidget {
+  const GearControl({super.key, required this.robot, required this.enabled, required this.onShift});
+
+  final RobotState? robot;
+
+  /// The mux takes gear changes only from its active source.
+  final bool enabled;
+  final ValueChanged<String> onShift;
+
+  static const _note = TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600, shadows: _shadow);
+
+  @override
+  Widget build(BuildContext context) {
+    final st = robot;
+    if (st == null) return const SizedBox.shrink();
+    if (!st.hasGears) {
+      return Text('robot has no gears', textAlign: TextAlign.center, style: _note.copyWith(color: warn));
+    }
+    final gear = st.gear!, top = st.gearSpeed;
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        _button('▼', const Key('gear-down'), enabled && gear > 1 ? () => onShift('down') : null),
+        Container(
+          width: 56,
+          height: 40,
+          margin: const EdgeInsets.symmetric(horizontal: 8),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(.35),
+            border: Border.all(color: Colors.white.withOpacity(.6), width: 2),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text('$gear',
+              key: const Key('gear-value'),
+              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800, shadows: _shadow)),
+        ),
+        _button('▲', const Key('gear-up'), enabled && gear < st.gears.length ? () => onShift('up') : null),
+      ]),
+      const SizedBox(height: 2),
+      Text.rich(
+        TextSpan(children: [
+          TextSpan(text: top == null ? '' : '≤ ${kmh(top)} km/h'),
+          if (st.steerLimited)
+            const TextSpan(text: '  ·  steering limited', style: TextStyle(color: Color(0xFFFDE68A))),
+        ]),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: _note,
+      ),
+    ]);
+  }
+
+  static Widget _button(String label, Key key, VoidCallback? onPressed) => _NoPageSwipe(
+        child: SizedBox(
+          width: 52,
+          height: 40,
+          child: OutlinedButton(
+            key: key,
+            onPressed: onPressed,
+            style: OutlinedButton.styleFrom(
+              padding: EdgeInsets.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              backgroundColor: Colors.white.withOpacity(.12),
+              foregroundColor: Colors.white,
+              disabledForegroundColor: Colors.white.withOpacity(.3),
+              side: BorderSide(color: Colors.white.withOpacity(onPressed == null ? .2 : .5), width: 2),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: Text(label, style: const TextStyle(fontSize: 18)),
+          ),
+        ),
+      );
 }
 
 /// Camera page, left thumb: the joystick drives only while this is held.
@@ -932,9 +1116,7 @@ class WheelsPage extends StatelessWidget {
       _gap,
       Expanded(
         child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          Expanded(
-              child:
-                  _NoPageSwipe(child: _button('Crab', send('steer_crab'), active: rs?.steering == 'crab'))),
+          Expanded(child: _NoPageSwipe(child: _button('Crab', send('steer_crab'), active: rs?.steering == 'crab'))),
           const SizedBox(width: 6),
           Expanded(
               child: _NoPageSwipe(

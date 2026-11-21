@@ -1,6 +1,7 @@
 // Foxglove WebSocket client (subprotocol foxglove.sdk.v1) for app_foxglove_bridge.
-// Publishes JSON-encoded /teleop/phone/cmd_vel, /teleop/phone/set_mode and
-// /teleop/phone/rover_cmd, and subscribes /teleop/state (the mode the robot is actually
+// Publishes JSON-encoded /teleop/phone/stick (the normalized joystick, navigation_ws #37)
+// (never cmd_vel: a mux without gears isn't driven); /teleop/phone/gear, /teleop/phone/set_mode
+// and /teleop/phone/rover_cmd; and subscribes /teleop/state (the mode the robot is actually
 // in) and /teleop/rover_state (robot_control's modes as orintwo tracks them). /teleop/camera/compressed
 // is subscribed only while the camera page wants it (app_teleop's teleop_camera relays
 // the ZED only while someone is subscribed). The Autonav page's topics (nav_relay,
@@ -12,6 +13,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
@@ -33,6 +35,52 @@ class RobotState {
   double get maxAngular => (json['max_angular'] as num).toDouble();
   double? get outVx => (json['out']?['vx'] as num?)?.toDouble();
   double? get outWz => (json['out']?['wz'] as num?)?.toDouble();
+
+  // Gears (navigation_ws #37). A mux from before #37 sends none of these keys: the app
+  // doesn't drive it (no cmd_vel path) and warns.
+
+  /// The mux has the gear system: `gears` is a non-empty list and `gear` a number.
+  bool get hasGears => gears.isNotEmpty && gear != null;
+
+  /// Current gear, 1-based.
+  int? get gear => _int(json['gear']);
+
+  /// Top speed of each gear in m/s (gear 1 first).
+  List<double> get gears => [
+        if (json['gears'] is List)
+          for (final g in json['gears'] as List)
+            if (g is num) g.toDouble()
+      ];
+
+  /// Top speed of the current gear (m/s), capped by max_linear; null without gears.
+  double? get gearSpeed {
+    final g = gear;
+    if (!hasGears || g == null || g < 1 || g > gears.length) return null;
+    return min(gears[g - 1], maxLinear);
+  }
+
+  /// `stick` | `cmd_vel`: what the mux last drove from.
+  String? get input => json['input'] as String?;
+  double? get vTarget => _num(json['v_target']);
+  double? get kappaMax => _num(json['kappa_max']);
+  bool get steerLimited => json['steer_limited'] == true;
+  double? get aLatMax => _num(json['a_lat_max']);
+
+  /// Measured forward speed (m/s, /odom_wheels); null when older than 0.5 s or absent.
+  double? get speedMeas => _num(json['speed_meas']);
+  double? get speedMeasAge => _num(json['speed_meas_age']);
+
+  /// What the km/h readouts show: the measured speed, else the commanded one (out.vx,
+  /// the ramped command, else v_target) with `measured` false; null when neither is there.
+  ({double mps, bool measured})? get speed {
+    final m = speedMeas;
+    if (m != null) return (mps: m, measured: true);
+    final c = outVx ?? vTarget;
+    return c == null ? null : (mps: c, measured: false);
+  }
+
+  static double? _num(Object? v) => v is num ? v.toDouble() : null;
+  static int? _int(Object? v) => v is num ? v.round() : (v is String ? int.tryParse(v) : null);
 
   bool get fresh => DateTime.now().difference(receivedAt) < const Duration(seconds: 1);
   bool get hearsPhone => phoneAge != null && phoneAge! < teleopTimeout;
@@ -63,7 +111,7 @@ class RoverState {
 enum Link { disconnected, connecting, connected }
 
 class FoxgloveClient extends ChangeNotifier {
-  static const _chCmd = 1, _chMode = 2, _chRover = 3, _chNav = 4, _subState = 1, _subCamera = 2, _subRover = 3;
+  static const _chMode = 2, _chRover = 3, _chNav = 4, _chStick = 5, _chGear = 6, _subState = 1, _subCamera = 2, _subRover = 3;
   static const cameraTopic = '/teleop/camera/compressed';
   static const roverStateTopic = '/teleop/rover_state';
   static const navStateTopic = '/teleop/nav/state', navMapTopic = '/teleop/nav/map', navMetaTopic = '/teleop/nav/map_meta';
@@ -185,12 +233,6 @@ class FoxgloveClient extends ChangeNotifier {
             'op': 'advertise',
             'channels': [
               {
-                'id': _chCmd,
-                'topic': '/teleop/phone/cmd_vel',
-                'encoding': 'json',
-                'schemaName': 'geometry_msgs/msg/Twist'
-              },
-              {
                 'id': _chMode,
                 'topic': '/teleop/phone/set_mode',
                 'encoding': 'json',
@@ -205,6 +247,18 @@ class FoxgloveClient extends ChangeNotifier {
               {
                 'id': _chNav,
                 'topic': '/teleop/phone/nav_cmd',
+                'encoding': 'json',
+                'schemaName': 'std_msgs/msg/String'
+              },
+              {
+                'id': _chStick,
+                'topic': '/teleop/phone/stick',
+                'encoding': 'json',
+                'schemaName': 'geometry_msgs/msg/Twist'
+              },
+              {
+                'id': _chGear,
+                'topic': '/teleop/phone/gear',
                 'encoding': 'json',
                 'schemaName': 'std_msgs/msg/String'
               },
@@ -474,10 +528,16 @@ class FoxgloveClient extends ChangeNotifier {
     sendRaw(Uint8List.fromList([...header.buffer.asUint8List(), ...utf8.encode(jsonEncode(obj))]));
   }
 
-  void drive(double vx, double wz) => _publish(_chCmd, {
-        'linear': {'x': vx, 'y': 0.0, 'z': 0.0},
-        'angular': {'x': 0.0, 'y': 0.0, 'z': wz},
+  /// The normalized joystick for a mux with gears (navigation_ws #37): throttle and steer
+  /// in -1..1, steer + = left. The mux turns it into cmd_vel (gear speed, ramp, lateral
+  /// limit). Sent at 10 Hz.
+  void stick(double throttle, double steer) => _publish(_chStick, {
+        'linear': {'x': throttle.clamp(-1.0, 1.0), 'y': 0.0, 'z': 0.0},
+        'angular': {'x': 0.0, 'y': 0.0, 'z': steer.clamp(-1.0, 1.0)},
       });
+
+  /// `up`, `down` or `1`–`4`. Sent once, like roverCmd: a repeat would shift twice.
+  void shift(String gear) => _publish(_chGear, {'data': gear});
 
   /// A robot_control command for orintwo (input_auto, steer_crab, steer_ackermann, resume,
   /// arm, reset). Sent once, not repeated like setMode: each one becomes /joy presses, and

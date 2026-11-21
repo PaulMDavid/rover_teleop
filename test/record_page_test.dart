@@ -610,7 +610,7 @@ class FakeClient extends FoxgloveClient {
   @override
   void stop() {}
   @override
-  void drive(double vx, double wz) {}
+  void stick(double throttle, double steer) {}
   @override
   void watchCamera(bool on) {}
   @override
