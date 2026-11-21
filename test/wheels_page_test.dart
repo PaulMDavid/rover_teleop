@@ -43,6 +43,9 @@ class Harness {
             onCommand: cmds.add,
             onArm: () => arms++,
             onStop: () => stops++,
+            onControls: () {},
+            onSystem: () {},
+            onAutonav: () {},
           ),
         ),
       );
