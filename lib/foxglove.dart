@@ -1,14 +1,23 @@
 // Foxglove WebSocket client (subprotocol foxglove.sdk.v1) for app_foxglove_bridge.
-// Publishes JSON-encoded /teleop/phone/cmd_vel, /teleop/phone/set_mode and
-// /teleop/phone/rover_cmd, and subscribes /teleop/state (the mode the robot is actually
+// Publishes JSON-encoded /teleop/phone/stick (the normalized joystick, navigation_ws #37)
+// (never cmd_vel: a mux without gears isn't driven); /teleop/phone/gear, /teleop/phone/set_mode
+// and /teleop/phone/rover_cmd; and subscribes /teleop/state (the mode the robot is actually
 // in) and /teleop/rover_state (robot_control's modes as orintwo tracks them). /teleop/camera/compressed
 // is subscribed only while the camera page wants it (app_teleop's teleop_camera relays
-// the ZED only while someone is subscribed).
+// the ZED only while someone is subscribed). The Autonav page's topics (nav_relay,
+// navigation_ws #30) are subscribed only while that page shows: /teleop/nav/state, and
+// the latched map /teleop/nav/map + /teleop/nav/map_meta, which are subscribed again
+// whenever a map half is missing (the bridge drops messages when its send buffer is full,
+// and a dropped map only comes again on a new subscription). Goals and bringup commands
+// go out on /teleop/phone/nav_cmd.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+
+import 'nav.dart';
 
 /// What teleop_mux reports on /teleop/state.
 class RobotState {
@@ -26,6 +35,52 @@ class RobotState {
   double get maxAngular => (json['max_angular'] as num).toDouble();
   double? get outVx => (json['out']?['vx'] as num?)?.toDouble();
   double? get outWz => (json['out']?['wz'] as num?)?.toDouble();
+
+  // Gears (navigation_ws #37). A mux from before #37 sends none of these keys: the app
+  // doesn't drive it (no cmd_vel path) and warns.
+
+  /// The mux has the gear system: `gears` is a non-empty list and `gear` a number.
+  bool get hasGears => gears.isNotEmpty && gear != null;
+
+  /// Current gear, 1-based.
+  int? get gear => _int(json['gear']);
+
+  /// Top speed of each gear in m/s (gear 1 first).
+  List<double> get gears => [
+        if (json['gears'] is List)
+          for (final g in json['gears'] as List)
+            if (g is num) g.toDouble()
+      ];
+
+  /// Top speed of the current gear (m/s), capped by max_linear; null without gears.
+  double? get gearSpeed {
+    final g = gear;
+    if (!hasGears || g == null || g < 1 || g > gears.length) return null;
+    return min(gears[g - 1], maxLinear);
+  }
+
+  /// `stick` | `cmd_vel`: what the mux last drove from.
+  String? get input => json['input'] as String?;
+  double? get vTarget => _num(json['v_target']);
+  double? get kappaMax => _num(json['kappa_max']);
+  bool get steerLimited => json['steer_limited'] == true;
+  double? get aLatMax => _num(json['a_lat_max']);
+
+  /// Measured forward speed (m/s, /odom_wheels); null when older than 0.5 s or absent.
+  double? get speedMeas => _num(json['speed_meas']);
+  double? get speedMeasAge => _num(json['speed_meas_age']);
+
+  /// What the km/h readouts show: the measured speed, else the commanded one (out.vx,
+  /// the ramped command, else v_target) with `measured` false; null when neither is there.
+  ({double mps, bool measured})? get speed {
+    final m = speedMeas;
+    if (m != null) return (mps: m, measured: true);
+    final c = outVx ?? vTarget;
+    return c == null ? null : (mps: c, measured: false);
+  }
+
+  static double? _num(Object? v) => v is num ? v.toDouble() : null;
+  static int? _int(Object? v) => v is num ? v.round() : (v is String ? int.tryParse(v) : null);
 
   bool get fresh => DateTime.now().difference(receivedAt) < const Duration(seconds: 1);
   bool get hearsPhone => phoneAge != null && phoneAge! < teleopTimeout;
@@ -56,9 +111,14 @@ class RoverState {
 enum Link { disconnected, connecting, connected }
 
 class FoxgloveClient extends ChangeNotifier {
-  static const _chCmd = 1, _chMode = 2, _chRover = 3, _subState = 1, _subCamera = 2, _subRover = 3;
+  static const _chMode = 2, _chRover = 3, _chNav = 4, _chStick = 5, _chGear = 6, _subState = 1, _subCamera = 2, _subRover = 3;
   static const cameraTopic = '/teleop/camera/compressed';
   static const roverStateTopic = '/teleop/rover_state';
+  static const navStateTopic = '/teleop/nav/state', navMapTopic = '/teleop/nav/map', navMetaTopic = '/teleop/nav/map_meta';
+
+  /// A map half missing this long after subscribing (or after the other half came) →
+  /// subscribe both again to get the latched copy.
+  static const mapRetry = Duration(seconds: 3);
 
   Link link = Link.disconnected;
   RobotState? state;
@@ -72,6 +132,21 @@ class FoxgloveClient extends ChangeNotifier {
   bool _wantCamera = false;
   int? _cameraChannel;
   bool _cameraSubscribed = false;
+
+  /// nav_relay's /teleop/nav/state while the Autonav page shows.
+  NavState? navState;
+
+  /// The newest map whose image and meta pair up; kept when the page closes.
+  NavMap? navMap;
+  bool _wantNav = false;
+  final _navChannels = <String, int>{}; // topic → bridge channel id
+  final _navSubs = <String, int>{}; // topic → our subscription id
+  final _metas = <MapMeta>[]; // recent metas, newest last, waiting for / paired with images
+  ({Uint8List png, double stamp})? _orphanImage; // image whose meta hasn't come (yet)
+  DateTime? _mapAsked; // last (re)subscription of the map topics
+  int _nextSub = 10;
+  Timer? _mapCheck;
+  int mapSubscriptions = 0; // how often the map was (re)subscribed: for the tests
 
   WebSocket? _ws;
   bool _running = false;
@@ -88,6 +163,8 @@ class FoxgloveClient extends ChangeNotifier {
     _generation++;
     _running = false;
     _retry?.cancel();
+    _mapCheck?.cancel();
+    _mapCheck = null;
     _ws?.close();
     _ws = null;
     _setLink(Link.disconnected);
@@ -119,6 +196,8 @@ class FoxgloveClient extends ChangeNotifier {
     _ws = null;
     _cameraChannel = null;
     _cameraSubscribed = false;
+    _navChannels.clear();
+    _navSubs.clear();
     _setLink(Link.disconnected);
     if (_running) {
       _retry?.cancel();
@@ -132,7 +211,18 @@ class FoxgloveClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _send(Map<String, dynamic> obj) => _ws?.add(jsonEncode(obj));
+  /// The socket is open (the tests override this and [sendRaw]).
+  @protected
+  bool get isOpen => _ws != null;
+
+  @protected
+  void sendRaw(Object data) => _ws?.add(data);
+
+  void _send(Map<String, dynamic> obj) => sendRaw(jsonEncode(obj));
+
+  /// A frame from the bridge, as the WebSocket delivers it.
+  @visibleForTesting
+  void handleMessage(dynamic data) => _onMessage(data);
 
   void _onMessage(dynamic data) {
     if (data is String) {
@@ -143,12 +233,6 @@ class FoxgloveClient extends ChangeNotifier {
             'op': 'advertise',
             'channels': [
               {
-                'id': _chCmd,
-                'topic': '/teleop/phone/cmd_vel',
-                'encoding': 'json',
-                'schemaName': 'geometry_msgs/msg/Twist'
-              },
-              {
                 'id': _chMode,
                 'topic': '/teleop/phone/set_mode',
                 'encoding': 'json',
@@ -157,6 +241,24 @@ class FoxgloveClient extends ChangeNotifier {
               {
                 'id': _chRover,
                 'topic': '/teleop/phone/rover_cmd',
+                'encoding': 'json',
+                'schemaName': 'std_msgs/msg/String'
+              },
+              {
+                'id': _chNav,
+                'topic': '/teleop/phone/nav_cmd',
+                'encoding': 'json',
+                'schemaName': 'std_msgs/msg/String'
+              },
+              {
+                'id': _chStick,
+                'topic': '/teleop/phone/stick',
+                'encoding': 'json',
+                'schemaName': 'geometry_msgs/msg/Twist'
+              },
+              {
+                'id': _chGear,
+                'topic': '/teleop/phone/gear',
                 'encoding': 'json',
                 'schemaName': 'std_msgs/msg/String'
               },
@@ -182,6 +284,15 @@ class FoxgloveClient extends ChangeNotifier {
               _cameraChannel = c['id'] as int;
               _cameraSubscribed = false;
               _syncCamera();
+            } else if (c['topic'] == navStateTopic || c['topic'] == navMapTopic || c['topic'] == navMetaTopic) {
+              final topic = c['topic'] as String;
+              _navChannels[topic] = c['id'] as int;
+              _navSubs.remove(topic); // a new channel: the old subscription is gone with it
+              if (topic == navStateTopic) {
+                _syncNav();
+              } else {
+                _askMap();
+              }
             }
           }
       }
@@ -195,6 +306,14 @@ class FoxgloveClient extends ChangeNotifier {
     final sub = v.getUint32(1, Endian.little);
     if (sub == _subCamera) {
       _onCameraFrame(b);
+      return;
+    }
+    if (sub == _navSubs[navMapTopic]) {
+      _onMapImage(b);
+      return;
+    }
+    if (sub == _navSubs[navStateTopic] || sub == _navSubs[navMetaTopic]) {
+      _onNavString(sub, b);
       return;
     }
     if (sub != _subState && sub != _subRover) return;
@@ -222,7 +341,7 @@ class FoxgloveClient extends ChangeNotifier {
 
   void _syncCamera() {
     final channel = _cameraChannel;
-    if (_ws == null || channel == null || _wantCamera == _cameraSubscribed) return;
+    if (!isOpen || channel == null || _wantCamera == _cameraSubscribed) return;
     if (_wantCamera) {
       _send({
         'op': 'subscribe',
@@ -254,33 +373,171 @@ class FoxgloveClient extends ChangeNotifier {
   void _onCameraFrame(Uint8List b) {
     if (!_wantCamera) return;
     try {
-      final body = ByteData.sublistView(b, 17);
-      var off = 8;
-      int skipString(int off) => off + 4 + body.getUint32(off, Endian.little);
-      off = skipString(off); // frame_id
-      off = (off + 3) & ~3;
-      off = skipString(off); // format
-      off = (off + 3) & ~3;
-      final n = body.getUint32(off, Endian.little);
-      final start = 17 + off + 4;
-      cameraFrame.value = Uint8List.sublistView(b, start, start + n);
+      cameraFrame.value = _compressedImage(b).data;
       _frameTimes.add(DateTime.now());
     } catch (_) {}
   }
 
+  static ({double stamp, Uint8List data}) _compressedImage(Uint8List b) {
+    final body = ByteData.sublistView(b, 17);
+    final stamp = body.getInt32(0, Endian.little) + body.getUint32(4, Endian.little) * 1e-9;
+    var off = 8;
+    int skipString(int off) => off + 4 + body.getUint32(off, Endian.little);
+    off = skipString(off); // frame_id
+    off = (off + 3) & ~3;
+    off = skipString(off); // format
+    off = (off + 3) & ~3;
+    final n = body.getUint32(off, Endian.little);
+    final start = 17 + off + 4;
+    if (start + n > b.length) throw const FormatException('short CompressedImage');
+    return (stamp: stamp, data: Uint8List.sublistView(b, start, start + n));
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Autonav (nav_relay)
+
+  /// Turn the Autonav topics on or off (the page showing). Opening it always asks for the
+  /// latched map again: a copy the bridge dropped earlier comes this way.
+  void watchNav(bool on) {
+    if (on == _wantNav) return;
+    _wantNav = on;
+    _syncNav();
+    if (on) {
+      _askMap();
+      _mapCheck ??= Timer.periodic(const Duration(milliseconds: 500), (_) => checkMap());
+    } else {
+      _mapCheck?.cancel();
+      _mapCheck = null;
+      _unsubscribe(navMapTopic);
+      _unsubscribe(navMetaTopic);
+      navState = null;
+    }
+  }
+
+  bool get navAvailable => _navChannels.containsKey(navStateTopic);
+
+  void _subscribe(String topic) {
+    final channel = _navChannels[topic];
+    if (!isOpen || channel == null) return;
+    final id = _nextSub++;
+    _navSubs[topic] = id;
+    _send({
+      'op': 'subscribe',
+      'subscriptions': [
+        {'id': id, 'channelId': channel}
+      ]
+    });
+  }
+
+  void _unsubscribe(String topic) {
+    final id = _navSubs.remove(topic);
+    if (id == null || !isOpen) return;
+    _send({
+      'op': 'unsubscribe',
+      'subscriptionIds': [id]
+    });
+  }
+
+  void _syncNav() {
+    final subscribed = _navSubs.containsKey(navStateTopic);
+    if (_wantNav && !subscribed) _subscribe(navStateTopic);
+    if (!_wantNav && subscribed) _unsubscribe(navStateTopic);
+  }
+
+  /// Unsubscribe + subscribe map and meta: the bridge sends the latched copy to the new
+  /// subscription. Fresh subscription ids, so a late frame of the old one is ignored.
+  void _askMap() {
+    if (!_wantNav || !isOpen) return;
+    if (!_navChannels.containsKey(navMapTopic) || !_navChannels.containsKey(navMetaTopic)) return;
+    _unsubscribe(navMetaTopic);
+    _unsubscribe(navMapTopic);
+    _subscribe(navMetaTopic); // meta first, as the relay publishes it
+    _subscribe(navMapTopic);
+    _mapAsked = DateTime.now();
+    mapSubscriptions++;
+  }
+
+  /// Every 0.5 s while the page shows: asks for the map again when, [mapRetry] after the
+  /// last ask, there is no map, or the newest meta still has no image, or an image came
+  /// without its meta.
+  @visibleForTesting
+  void checkMap({DateTime? now}) {
+    final asked = _mapAsked;
+    if (!_wantNav) return;
+    if (asked == null) {
+      _askMap();
+      return;
+    }
+    final t = now ?? DateTime.now();
+    if (t.difference(asked) < mapRetry) return;
+    final newest = _metas.isEmpty ? null : _metas.last;
+    final missing = navMap == null || _orphanImage != null || (newest != null && navMap!.meta.stamp != newest.stamp);
+    if (missing) _askMap();
+  }
+
+  void _onNavString(int sub, Uint8List b) {
+    final v = ByteData.sublistView(b);
+    final len = v.getUint32(17, Endian.little);
+    try {
+      final json = jsonDecode(utf8.decode(b.sublist(21, 21 + len - 1))) as Map<String, dynamic>;
+      if (sub == _navSubs[navStateTopic]) {
+        navState = NavState(json);
+      } else {
+        _onMeta(MapMeta.fromJson(json));
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  void _onMeta(MapMeta meta) {
+    _metas.removeWhere((m) => m.stamp == meta.stamp);
+    _metas.add(meta);
+    if (_metas.length > 4) _metas.removeAt(0);
+    final orphan = _orphanImage;
+    if (orphan != null && meta.pairs(orphan.stamp, orphan.png.length)) {
+      _orphanImage = null;
+      navMap = NavMap(meta, orphan.png);
+    }
+  }
+
+  void _onMapImage(Uint8List b) {
+    try {
+      final img = _compressedImage(b);
+      final png = Uint8List.fromList(img.data); // the frame buffer isn't ours to keep
+      final meta = _metas.reversed.where((m) => m.pairs(img.stamp, png.length)).firstOrNull;
+      if (meta == null) {
+        _orphanImage = (png: png, stamp: img.stamp);
+      } else {
+        _orphanImage = null;
+        navMap = NavMap(meta, png);
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// One /teleop/phone/nav_cmd (nav_relay's JSON); sent once, like roverCmd.
+  void navCmd(Map<String, dynamic> cmd) => _publish(_chNav, {'data': jsonEncode(cmd)});
+
+  void navGoal(double x, double y, double yaw) => navCmd({'cmd': 'goal', 'x': x, 'y': y, 'yaw': yaw});
+
   void _publish(int channel, Map<String, dynamic> obj) {
-    final ws = _ws;
-    if (ws == null) return;
+    if (!isOpen) return;
     final header = ByteData(5)
       ..setUint8(0, 1) // clientMessageData
       ..setUint32(1, channel, Endian.little);
-    ws.add(Uint8List.fromList([...header.buffer.asUint8List(), ...utf8.encode(jsonEncode(obj))]));
+    sendRaw(Uint8List.fromList([...header.buffer.asUint8List(), ...utf8.encode(jsonEncode(obj))]));
   }
 
-  void drive(double vx, double wz) => _publish(_chCmd, {
-        'linear': {'x': vx, 'y': 0.0, 'z': 0.0},
-        'angular': {'x': 0.0, 'y': 0.0, 'z': wz},
+  /// The normalized joystick for a mux with gears (navigation_ws #37): throttle and steer
+  /// in -1..1, steer + = left. The mux turns it into cmd_vel (gear speed, ramp, lateral
+  /// limit). Sent at 10 Hz.
+  void stick(double throttle, double steer) => _publish(_chStick, {
+        'linear': {'x': throttle.clamp(-1.0, 1.0), 'y': 0.0, 'z': 0.0},
+        'angular': {'x': 0.0, 'y': 0.0, 'z': steer.clamp(-1.0, 1.0)},
       });
+
+  /// `up`, `down` or `1`–`4`. Sent once, like roverCmd: a repeat would shift twice.
+  void shift(String gear) => _publish(_chGear, {'data': gear});
 
   /// A robot_control command for orintwo (input_auto, steer_crab, steer_ackermann, resume,
   /// arm, reset). Sent once, not repeated like setMode: each one becomes /joy presses, and
